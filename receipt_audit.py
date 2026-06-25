@@ -76,7 +76,7 @@ class Match:
 def clean_text(value: object) -> str:
     if value is None:
         return ""
-    text = str(value).lower()
+    text = str(value).lower().replace(",", "")
     text = re.sub(r"[^a-z0-9.]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -128,6 +128,8 @@ def date_tokens(value: Optional[dt.date]) -> List[str]:
         value.strftime("%m%d%Y"),
         value.strftime("%m%d%y"),
         value.strftime("%Y%m%d"),
+        value.strftime("%Y %m%d"),
+        value.strftime("%Y %m %d"),
         value.strftime("%m %d %Y").lower(),
         value.strftime("%b %d %Y").lower(),
         value.strftime("%B %d %Y").lower(),
@@ -139,7 +141,11 @@ def amount_tokens(value: Optional[Decimal]) -> List[str]:
         return []
     plain = f"{value:.2f}"
     dollars = plain.split(".")[0]
-    return [plain, plain.replace(".", ""), f"${plain}", dollars]
+    trimmed = plain.rstrip("0").rstrip(".")
+    tokens = [plain, plain.replace(".", ""), f"${plain}", dollars]
+    if trimmed != plain:
+        tokens.extend([trimmed, f"${trimmed}"])
+    return tokens
 
 
 def merchant_score(merchant: str, text: str) -> float:
@@ -196,7 +202,7 @@ def find_header_row_and_columns(ws) -> Tuple[int, Dict[str, int]]:
             if not header:
                 continue
             for key, aliases in HEADER_ALIASES.items():
-                if header in aliases:
+                if header in aliases and key not in seen:
                     seen[key] = col
         if "amount" in seen and ("merchant" in seen or "date" in seen):
             return row, seen
@@ -204,6 +210,25 @@ def find_header_row_and_columns(ws) -> Tuple[int, Dict[str, int]]:
         "Could not identify the workbook headers. Expected columns like Date, "
         "Description/Merchant, and Amount/Charge."
     )
+
+
+def find_charge_sheet(wb):
+    errors = []
+    preferred_names = ("transaction details", "master_use me", "master")
+    worksheets = sorted(
+        wb.worksheets,
+        key=lambda sheet: (
+            clean_text(sheet.title) not in preferred_names,
+            wb.worksheets.index(sheet),
+        ),
+    )
+    for ws in worksheets:
+        try:
+            header_row, columns = find_header_row_and_columns(ws)
+            return ws, header_row, columns
+        except ValueError as exc:
+            errors.append(f"{ws.title}: {exc}")
+    raise ValueError("Could not find a transaction worksheet. " + " | ".join(errors))
 
 
 def ensure_output_columns(ws, header_row: int) -> Dict[str, int]:
@@ -281,8 +306,7 @@ def audit_workbook(
     threshold: float,
 ) -> Tuple[int, int]:
     wb = load_workbook(excel_path)
-    ws = wb.active
-    header_row, columns = find_header_row_and_columns(ws)
+    ws, header_row, columns = find_charge_sheet(wb)
     output_columns = ensure_output_columns(ws, header_row)
     receipts = load_receipts(receipts_dir, excel_path, recursive)
 

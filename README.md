@@ -49,6 +49,8 @@ It scans common receipt formats including PDF, PNG, JPG, JPEG, HEIC, WEBP, TIF, 
 
 If the workbook headers are unusual, rename them to common labels such as `Date`, `Description`, and `Amount`.
 
+The workbook does not need to open directly on the transaction sheet. The checker searches worksheets for transaction-style headers and prefers a sheet named `Transaction Details` when present.
+
 ## Tests
 
 ```powershell
