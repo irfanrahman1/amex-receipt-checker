@@ -186,14 +186,14 @@ def invoice_text(receipt: Receipt) -> str:
     text = receipt.searchable_text
     patterns = (
         r"\binvoice\s*(?:number|no|#)?\s*([a-z0-9-]{3,})\b",
-        r"\binv\s*(?:number|no|#)?\s*([a-z0-9-]{3,})\b",
+        r"\binv(?:\.|\s)+(?:number|no|#)?\s*([a-z0-9-]{3,})\b",
         r"#\s*([a-z0-9-]{3,})\b",
     )
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
             value = match.group(1).upper()
-            if value not in generic_values:
+            if value not in generic_values and any(char.isdigit() for char in value):
                 return value
     return "NoInvoice"
 
@@ -218,7 +218,10 @@ def unique_path(path: Path) -> Path:
 
 
 def rename_receipt(charge: Charge, receipt: Receipt) -> Path:
-    new_path = unique_path(receipt.path.with_name(receipt_filename(charge, receipt)))
+    target_path = receipt.path.with_name(receipt_filename(charge, receipt))
+    if target_path.resolve() == receipt.path.resolve():
+        return receipt.path
+    new_path = unique_path(target_path)
     if new_path == receipt.path:
         return receipt.path
     receipt.path.rename(new_path)
@@ -290,15 +293,29 @@ def find_header_row_and_columns(ws) -> Tuple[int, Dict[str, int]]:
     )
 
 
-def find_charge_sheet(wb):
+def infer_target_year(path: Path) -> Optional[str]:
+    match = re.search(r"\b(20\d{2})\b", str(path))
+    return match.group(1) if match else None
+
+
+def find_charge_sheet(wb, target_year: Optional[str] = None):
     errors = []
     preferred_names = ("transaction details", "master_use me", "master")
+    target_year_clean = clean_text(target_year) if target_year else ""
+
+    def sheet_priority(sheet):
+        title = clean_text(sheet.title)
+        if title in preferred_names:
+            return 0
+        if target_year_clean and title == target_year_clean:
+            return 1
+        if target_year_clean and target_year_clean in title:
+            return 2
+        return 3
+
     worksheets = sorted(
         wb.worksheets,
-        key=lambda sheet: (
-            clean_text(sheet.title) not in preferred_names,
-            wb.worksheets.index(sheet),
-        ),
+        key=lambda sheet: (sheet_priority(sheet), wb.worksheets.index(sheet)),
     )
     for ws in worksheets:
         try:
@@ -401,7 +418,7 @@ def audit_workbook(
     rename_receipts: bool,
 ) -> Tuple[int, int, int]:
     wb = load_workbook(excel_path)
-    ws, header_row, columns = find_charge_sheet(wb)
+    ws, header_row, columns = find_charge_sheet(wb, infer_target_year(excel_path))
     output_columns = ensure_output_columns(ws, header_row)
     receipts = load_receipts(receipts_dir, excel_path, recursive)
 

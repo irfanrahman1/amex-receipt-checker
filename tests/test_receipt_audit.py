@@ -82,6 +82,44 @@ class ReceiptAuditTests(unittest.TestCase):
             ws = audited["Transaction Details"]
             self.assertEqual(ws["I4"].value, "Acquired")
 
+    def test_prefers_year_sheet_from_workbook_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "03 March 2026"
+            folder.mkdir()
+            workbook_path = folder / "03 March 2026 AMEX Transaction Details.xlsx"
+            output_path = folder / "audited.xlsx"
+
+            wb = Workbook()
+            ws_2025 = wb.active
+            ws_2025.title = "2025"
+            ws_2025.append(["Date", "Vendor", "Amount"])
+            ws_2025.append(["03/03/2025", "OLD VENDOR", "1.00"])
+
+            ws_2026 = wb.create_sheet("2026")
+            ws_2026.append(["Date", "Vendor", "Amount"])
+            ws_2026.append(["03/03/2026", "NEW VENDOR", "2.00"])
+            wb.save(workbook_path)
+
+            (folder / "2026_0303_NEW VENDOR_#1234_$2.00.pdf").write_text("receipt", encoding="utf-8")
+
+            acquired, missing, renamed = audit_workbook(
+                excel_path=workbook_path,
+                receipts_dir=folder,
+                output_path=output_path,
+                recursive=True,
+                threshold=0.55,
+                date_window_days=3,
+                rename_receipts=False,
+            )
+
+            self.assertEqual(acquired, 1)
+            self.assertEqual(missing, 0)
+            self.assertEqual(renamed, 0)
+
+            audited = load_workbook(output_path)
+            self.assertEqual(audited["2026"]["D2"].value, "Acquired")
+            self.assertIsNone(audited["2025"]["D2"].value)
+
     def test_renames_receipt_to_vendor_invoice_date(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
