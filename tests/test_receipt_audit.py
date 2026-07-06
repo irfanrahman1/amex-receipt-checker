@@ -23,16 +23,19 @@ class ReceiptAuditTests(unittest.TestCase):
 
             (folder / "20260601 Hotel Example 125.40.jpg").write_text("receipt", encoding="utf-8")
 
-            acquired, missing = audit_workbook(
+            acquired, missing, renamed = audit_workbook(
                 excel_path=workbook_path,
                 receipts_dir=folder,
                 output_path=output_path,
                 recursive=True,
                 threshold=0.55,
+                date_window_days=3,
+                rename_receipts=False,
             )
 
             self.assertEqual(acquired, 1)
             self.assertEqual(missing, 1)
+            self.assertEqual(renamed, 0)
 
             audited = load_workbook(output_path)
             ws = audited.active
@@ -61,20 +64,58 @@ class ReceiptAuditTests(unittest.TestCase):
 
             (folder / "2026_0603_GTLaw_#8106_$5,000.00.pdf").write_text("receipt", encoding="utf-8")
 
-            acquired, missing = audit_workbook(
+            acquired, missing, renamed = audit_workbook(
                 excel_path=workbook_path,
                 receipts_dir=folder,
                 output_path=output_path,
                 recursive=True,
                 threshold=0.55,
+                date_window_days=3,
+                rename_receipts=False,
             )
 
             self.assertEqual(acquired, 1)
             self.assertEqual(missing, 0)
+            self.assertEqual(renamed, 0)
 
             audited = load_workbook(output_path)
             ws = audited["Transaction Details"]
             self.assertEqual(ws["I4"].value, "Acquired")
+
+    def test_renames_receipt_to_vendor_invoice_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            workbook_path = folder / "charges.xlsx"
+            output_path = folder / "audited.xlsx"
+
+            wb = Workbook()
+            ws = wb.active
+            ws.append(["Date", "Vendor", "Amount"])
+            ws.append(["06/03/2026", "GTLAW", "5000.00"])
+            wb.save(workbook_path)
+
+            receipt_path = folder / "2026_0603_GTLaw_#8106_$5,000.00.pdf"
+            receipt_path.write_text("receipt", encoding="utf-8")
+
+            acquired, missing, renamed = audit_workbook(
+                excel_path=workbook_path,
+                receipts_dir=folder,
+                output_path=output_path,
+                recursive=True,
+                threshold=0.55,
+                date_window_days=3,
+                rename_receipts=True,
+            )
+
+            self.assertEqual(acquired, 1)
+            self.assertEqual(missing, 0)
+            self.assertEqual(renamed, 1)
+            renamed_path = folder / "GTLAW - 8106 - 2026-06-03.pdf"
+            self.assertTrue(renamed_path.exists())
+
+            audited = load_workbook(output_path)
+            ws = audited.active
+            self.assertEqual(ws["E2"].value, "GTLAW - 8106 - 2026-06-03.pdf")
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from openpyxl import load_workbook
 
@@ -136,6 +136,21 @@ def date_tokens(value: Optional[dt.date]) -> List[str]:
     ]
 
 
+def extract_dates(text: str) -> List[dt.date]:
+    dates: Set[dt.date] = set()
+    for year, month, day in re.findall(r"\b(20\d{2})\s*(\d{2})(\d{2})\b", text):
+        try:
+            dates.add(dt.date(int(year), int(month), int(day)))
+        except ValueError:
+            pass
+    for month, day, year in re.findall(r"\b(\d{1,2})\s+(\d{1,2})\s+(20\d{2})\b", text):
+        try:
+            dates.add(dt.date(int(year), int(month), int(day)))
+        except ValueError:
+            pass
+    return sorted(dates)
+
+
 def amount_tokens(value: Optional[Decimal]) -> List[str]:
     if value is None:
         return []
@@ -146,6 +161,69 @@ def amount_tokens(value: Optional[Decimal]) -> List[str]:
     if trimmed != plain:
         tokens.extend([trimmed, f"${trimmed}"])
     return tokens
+
+
+def merchant_filename_text(merchant: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9]+", " ", str(merchant or ""))
+    words = [word for word in text.split() if len(word) > 1]
+    return " ".join(words[:5]) or "Receipt"
+
+
+def safe_filename_part(value: str) -> str:
+    value = re.sub(r'[<>:"/\\|?*]+', "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value[:80] or "Receipt"
+
+
+def invoice_text(receipt: Receipt) -> str:
+    generic_values = {"INVOICE", "NUMBER", "NO", "DATE", "AMOUNT", "TOTAL", "RECEIPT"}
+    stem_match = re.search(r"#([a-zA-Z0-9-]{3,})", receipt.path.stem)
+    if stem_match:
+        value = stem_match.group(1).upper()
+        if value not in generic_values:
+            return value
+
+    text = receipt.searchable_text
+    patterns = (
+        r"\binvoice\s*(?:number|no|#)?\s*([a-z0-9-]{3,})\b",
+        r"\binv\s*(?:number|no|#)?\s*([a-z0-9-]{3,})\b",
+        r"#\s*([a-z0-9-]{3,})\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            value = match.group(1).upper()
+            if value not in generic_values:
+                return value
+    return "NoInvoice"
+
+
+def receipt_filename(charge: Charge, receipt: Receipt) -> str:
+    date_part = charge.date.strftime("%Y-%m-%d") if charge.date else "NoDate"
+    merchant_part = safe_filename_part(merchant_filename_text(charge.merchant))
+    invoice_part = safe_filename_part(invoice_text(receipt))
+    return f"{merchant_part} - {invoice_part} - {date_part}{receipt.path.suffix.lower()}"
+
+
+def unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{stem}_{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not find an available filename for {path}")
+
+
+def rename_receipt(charge: Charge, receipt: Receipt) -> Path:
+    new_path = unique_path(receipt.path.with_name(receipt_filename(charge, receipt)))
+    if new_path == receipt.path:
+        return receipt.path
+    receipt.path.rename(new_path)
+    receipt.path = new_path
+    return new_path
 
 
 def merchant_score(merchant: str, text: str) -> float:
@@ -263,7 +341,7 @@ def iter_charges(ws, header_row: int, columns: Dict[str, int]) -> Iterable[Charg
         yield Charge(row=row, date=date, merchant=merchant, amount=amount)
 
 
-def score_receipt(charge: Charge, receipt: Receipt) -> Tuple[float, List[str]]:
+def score_receipt(charge: Charge, receipt: Receipt, date_window_days: int) -> Tuple[float, List[str]]:
     text = receipt.searchable_text
     score = 0.0
     notes = []
@@ -277,6 +355,13 @@ def score_receipt(charge: Charge, receipt: Receipt) -> Tuple[float, List[str]]:
     if date_hit:
         score += 0.20
         notes.append("date")
+    elif charge.date and date_window_days > 0:
+        receipt_dates = extract_dates(text)
+        if receipt_dates:
+            closest_days = min(abs((receipt_date - charge.date).days) for receipt_date in receipt_dates)
+            if closest_days <= date_window_days:
+                score += 0.14
+                notes.append(f"date within {closest_days} day(s)")
 
     merch = merchant_score(charge.merchant, text)
     if merch >= 0.55:
@@ -286,10 +371,18 @@ def score_receipt(charge: Charge, receipt: Receipt) -> Tuple[float, List[str]]:
     return score, notes
 
 
-def best_match(charge: Charge, receipts: List[Receipt], threshold: float) -> Match:
+def best_match(
+    charge: Charge,
+    receipts: List[Receipt],
+    threshold: float,
+    date_window_days: int,
+    used_receipts: Set[Path],
+) -> Match:
     best = Match(receipt=None, score=0.0, notes="")
     for receipt in receipts:
-        score, notes = score_receipt(charge, receipt)
+        if receipt.path.resolve() in used_receipts:
+            continue
+        score, notes = score_receipt(charge, receipt, date_window_days)
         if score > best.score:
             best = Match(receipt=receipt, score=score, notes=", ".join(notes))
 
@@ -304,7 +397,9 @@ def audit_workbook(
     output_path: Path,
     recursive: bool,
     threshold: float,
-) -> Tuple[int, int]:
+    date_window_days: int,
+    rename_receipts: bool,
+) -> Tuple[int, int, int]:
     wb = load_workbook(excel_path)
     ws, header_row, columns = find_charge_sheet(wb)
     output_columns = ensure_output_columns(ws, header_row)
@@ -312,10 +407,18 @@ def audit_workbook(
 
     acquired = 0
     missing = 0
+    renamed = 0
+    used_receipts: Set[Path] = set()
     for charge in iter_charges(ws, header_row, columns):
-        match = best_match(charge, receipts, threshold)
+        match = best_match(charge, receipts, threshold, date_window_days, used_receipts)
         if match.receipt:
             acquired += 1
+            old_path = match.receipt.path
+            if rename_receipts:
+                rename_receipt(charge, match.receipt)
+                if match.receipt.path != old_path:
+                    renamed += 1
+            used_receipts.add(match.receipt.path.resolve())
             ws.cell(row=charge.row, column=output_columns[STATUS_HEADER]).value = "Acquired"
             ws.cell(row=charge.row, column=output_columns[MATCH_HEADER]).value = str(
                 match.receipt.path.relative_to(receipts_dir)
@@ -329,7 +432,7 @@ def audit_workbook(
         )
 
     wb.save(output_path)
-    return acquired, missing
+    return acquired, missing, renamed
 
 
 def default_output_path(excel_path: Path) -> Path:
@@ -362,6 +465,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.55,
         help="Match threshold from 0.0 to 1.0. Default: 0.55.",
     )
+    parser.add_argument(
+        "--date-window-days",
+        type=int,
+        default=3,
+        help="Allow receipt dates this many days before/after the workbook date. Default: 3.",
+    )
+    parser.add_argument(
+        "--rename-receipts",
+        action="store_true",
+        help="Rename matched receipt files to Vendor - Invoice - Date.ext.",
+    )
     return parser
 
 
@@ -378,16 +492,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Receipt folder not found: {receipts_dir}", file=sys.stderr)
         return 2
 
-    acquired, missing = audit_workbook(
+    acquired, missing, renamed = audit_workbook(
         excel_path=excel_path,
         receipts_dir=receipts_dir,
         output_path=output_path,
         recursive=not args.no_recursive,
         threshold=args.threshold,
+        date_window_days=args.date_window_days,
+        rename_receipts=args.rename_receipts,
     )
     print(f"Saved audited workbook: {output_path}")
     print(f"Acquired: {acquired}")
     print(f"Missing: {missing}")
+    if args.rename_receipts:
+        print(f"Renamed receipts: {renamed}")
     return 0
 
 

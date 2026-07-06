@@ -31,6 +31,18 @@ If receipts are in a different folder:
 .\.venv\Scripts\python receipt_audit.py "C:\Path\To\charges.xlsx" --receipts-dir "C:\Path\To\Receipts"
 ```
 
+To also rename matched receipts:
+
+```powershell
+.\.venv\Scripts\python receipt_audit.py "C:\Path\To\charges.xlsx" --receipts-dir "C:\Path\To\Receipts" --rename-receipts
+```
+
+Renamed receipts use this format:
+
+```text
+Vendor - Invoice - Date.ext
+```
+
 The output defaults to a new file beside the workbook, such as:
 
 ```text
@@ -44,6 +56,8 @@ The checker looks for:
 - charge amount
 - charge date
 - merchant or description text
+
+By default, receipt dates can be up to 3 days before or after the workbook date. This helps when AmEx posts a charge later than the actual receipt date. Change this with `--date-window-days`.
 
 It scans common receipt formats including PDF, PNG, JPG, JPEG, HEIC, WEBP, TIF, and TIFF. For PDFs, it can read embedded text when the PDF contains text. Scanned image-only PDFs and photos are matched by filename only.
 
