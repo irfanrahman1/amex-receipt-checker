@@ -37,11 +37,19 @@ To also rename matched receipts:
 .\.venv\Scripts\python receipt_audit.py "C:\Path\To\charges.xlsx" --receipts-dir "C:\Path\To\Receipts" --rename-receipts
 ```
 
+To match the finished-folder workflow, rename matched receipts and move them into `DONE`:
+
+```powershell
+.\.venv\Scripts\python receipt_audit.py "C:\Path\To\charges.xlsx" --receipts-dir "C:\Path\To\Receipts" --rename-receipts --move-to-done
+```
+
 Renamed receipts use this format:
 
 ```text
 Vendor - Invoice - Date.ext
 ```
+
+When the workbook already has a `Receipt` column, acquired rows are marked `yes` and missing rows are left blank, matching the manual review format.
 
 The output defaults to a new file beside the workbook, such as:
 

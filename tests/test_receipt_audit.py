@@ -23,7 +23,7 @@ class ReceiptAuditTests(unittest.TestCase):
 
             (folder / "20260601 Hotel Example 125.40.jpg").write_text("receipt", encoding="utf-8")
 
-            acquired, missing, renamed = audit_workbook(
+            acquired, missing, renamed, moved = audit_workbook(
                 excel_path=workbook_path,
                 receipts_dir=folder,
                 output_path=output_path,
@@ -36,6 +36,7 @@ class ReceiptAuditTests(unittest.TestCase):
             self.assertEqual(acquired, 1)
             self.assertEqual(missing, 1)
             self.assertEqual(renamed, 0)
+            self.assertEqual(moved, 0)
 
             audited = load_workbook(output_path)
             ws = audited.active
@@ -64,7 +65,7 @@ class ReceiptAuditTests(unittest.TestCase):
 
             (folder / "2026_0603_GTLaw_#8106_$5,000.00.pdf").write_text("receipt", encoding="utf-8")
 
-            acquired, missing, renamed = audit_workbook(
+            acquired, missing, renamed, moved = audit_workbook(
                 excel_path=workbook_path,
                 receipts_dir=folder,
                 output_path=output_path,
@@ -77,6 +78,7 @@ class ReceiptAuditTests(unittest.TestCase):
             self.assertEqual(acquired, 1)
             self.assertEqual(missing, 0)
             self.assertEqual(renamed, 0)
+            self.assertEqual(moved, 0)
 
             audited = load_workbook(output_path)
             ws = audited["Transaction Details"]
@@ -102,7 +104,7 @@ class ReceiptAuditTests(unittest.TestCase):
 
             (folder / "2026_0303_NEW VENDOR_#1234_$2.00.pdf").write_text("receipt", encoding="utf-8")
 
-            acquired, missing, renamed = audit_workbook(
+            acquired, missing, renamed, moved = audit_workbook(
                 excel_path=workbook_path,
                 receipts_dir=folder,
                 output_path=output_path,
@@ -115,6 +117,7 @@ class ReceiptAuditTests(unittest.TestCase):
             self.assertEqual(acquired, 1)
             self.assertEqual(missing, 0)
             self.assertEqual(renamed, 0)
+            self.assertEqual(moved, 0)
 
             audited = load_workbook(output_path)
             self.assertEqual(audited["2026"]["D2"].value, "Acquired")
@@ -135,7 +138,7 @@ class ReceiptAuditTests(unittest.TestCase):
             receipt_path = folder / "2026_0603_GTLaw_#8106_$5,000.00.pdf"
             receipt_path.write_text("receipt", encoding="utf-8")
 
-            acquired, missing, renamed = audit_workbook(
+            acquired, missing, renamed, moved = audit_workbook(
                 excel_path=workbook_path,
                 receipts_dir=folder,
                 output_path=output_path,
@@ -148,12 +151,55 @@ class ReceiptAuditTests(unittest.TestCase):
             self.assertEqual(acquired, 1)
             self.assertEqual(missing, 0)
             self.assertEqual(renamed, 1)
+            self.assertEqual(moved, 0)
             renamed_path = folder / "GTLAW - 8106 - 2026-06-03.pdf"
             self.assertTrue(renamed_path.exists())
 
             audited = load_workbook(output_path)
             ws = audited.active
             self.assertEqual(ws["E2"].value, "GTLAW - 8106 - 2026-06-03.pdf")
+
+    def test_marks_receipt_column_and_moves_to_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            workbook_path = folder / "charges.xlsx"
+            output_path = folder / "audited.xlsx"
+
+            wb = Workbook()
+            ws = wb.active
+            ws.append(["Date", "Receipt", "Vendor", "Amount"])
+            ws.append(["06/03/2026", "", "GTLAW", "5000.00"])
+            ws.append(["06/04/2026", "yes", "Missing Vendor", "10.00"])
+            wb.save(workbook_path)
+
+            receipt_path = folder / "2026_0603_GTLaw_#8106_$5,000.00.pdf"
+            receipt_path.write_text("receipt", encoding="utf-8")
+
+            acquired, missing, renamed, moved = audit_workbook(
+                excel_path=workbook_path,
+                receipts_dir=folder,
+                output_path=output_path,
+                recursive=True,
+                threshold=0.55,
+                date_window_days=3,
+                rename_receipts=True,
+                move_to_done=True,
+            )
+
+            self.assertEqual(acquired, 1)
+            self.assertEqual(missing, 1)
+            self.assertEqual(renamed, 1)
+            self.assertEqual(moved, 1)
+            self.assertFalse(receipt_path.exists())
+
+            done_receipt = folder / "DONE" / "GTLAW - 8106 - 2026-06-03.pdf"
+            self.assertTrue(done_receipt.exists())
+
+            audited = load_workbook(output_path)
+            ws = audited.active
+            self.assertEqual(ws["B2"].value, "yes")
+            self.assertIsNone(ws["B3"].value)
+            self.assertEqual(ws["F2"].value, "DONE\\GTLAW - 8106 - 2026-06-03.pdf")
 
 
 if __name__ == "__main__":

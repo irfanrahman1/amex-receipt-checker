@@ -50,6 +50,7 @@ HEADER_ALIASES = {
 STATUS_HEADER = "Receipt Status"
 MATCH_HEADER = "Matched Receipt"
 NOTES_HEADER = "Receipt Match Notes"
+RECEIPT_FLAG_HEADER = "Receipt"
 
 
 @dataclass
@@ -217,8 +218,11 @@ def unique_path(path: Path) -> Path:
     raise RuntimeError(f"Could not find an available filename for {path}")
 
 
-def rename_receipt(charge: Charge, receipt: Receipt) -> Path:
-    target_path = receipt.path.with_name(receipt_filename(charge, receipt))
+def rename_receipt(charge: Charge, receipt: Receipt, target_dir: Optional[Path] = None, rename: bool = True) -> Path:
+    target_dir = target_dir or receipt.path.parent
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_name = receipt_filename(charge, receipt) if rename else receipt.path.name
+    target_path = target_dir / target_name
     if target_path.resolve() == receipt.path.resolve():
         return receipt.path
     new_path = unique_path(target_path)
@@ -344,6 +348,13 @@ def ensure_output_columns(ws, header_row: int) -> Dict[str, int]:
     return output
 
 
+def receipt_flag_column(ws, header_row: int) -> Optional[int]:
+    for col in range(1, ws.max_column + 1):
+        if clean_text(ws.cell(row=header_row, column=col).value) == clean_text(RECEIPT_FLAG_HEADER):
+            return col
+    return None
+
+
 def iter_charges(ws, header_row: int, columns: Dict[str, int]) -> Iterable[Charge]:
     for row in range(header_row + 1, ws.max_row + 1):
         amount = parse_amount(ws.cell(row=row, column=columns["amount"]).value)
@@ -416,32 +427,43 @@ def audit_workbook(
     threshold: float,
     date_window_days: int,
     rename_receipts: bool,
-) -> Tuple[int, int, int]:
+    move_to_done: bool = False,
+) -> Tuple[int, int, int, int]:
     wb = load_workbook(excel_path)
     ws, header_row, columns = find_charge_sheet(wb, infer_target_year(excel_path))
     output_columns = ensure_output_columns(ws, header_row)
+    flag_column = receipt_flag_column(ws, header_row)
     receipts = load_receipts(receipts_dir, excel_path, recursive)
+    done_dir = receipts_dir / "DONE" if move_to_done else None
 
     acquired = 0
     missing = 0
     renamed = 0
+    moved = 0
     used_receipts: Set[Path] = set()
     for charge in iter_charges(ws, header_row, columns):
         match = best_match(charge, receipts, threshold, date_window_days, used_receipts)
         if match.receipt:
             acquired += 1
             old_path = match.receipt.path
-            if rename_receipts:
-                rename_receipt(charge, match.receipt)
+            if rename_receipts or move_to_done:
+                rename_receipt(charge, match.receipt, target_dir=done_dir, rename=rename_receipts)
                 if match.receipt.path != old_path:
-                    renamed += 1
+                    if match.receipt.path.name != old_path.name:
+                        renamed += 1
+                    if match.receipt.path.parent.resolve() != old_path.parent.resolve():
+                        moved += 1
             used_receipts.add(match.receipt.path.resolve())
+            if flag_column:
+                ws.cell(row=charge.row, column=flag_column).value = "yes"
             ws.cell(row=charge.row, column=output_columns[STATUS_HEADER]).value = "Acquired"
             ws.cell(row=charge.row, column=output_columns[MATCH_HEADER]).value = str(
                 match.receipt.path.relative_to(receipts_dir)
             )
         else:
             missing += 1
+            if flag_column:
+                ws.cell(row=charge.row, column=flag_column).value = ""
             ws.cell(row=charge.row, column=output_columns[STATUS_HEADER]).value = "Missing"
             ws.cell(row=charge.row, column=output_columns[MATCH_HEADER]).value = ""
         ws.cell(row=charge.row, column=output_columns[NOTES_HEADER]).value = (
@@ -449,7 +471,7 @@ def audit_workbook(
         )
 
     wb.save(output_path)
-    return acquired, missing, renamed
+    return acquired, missing, renamed, moved
 
 
 def default_output_path(excel_path: Path) -> Path:
@@ -493,6 +515,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Rename matched receipt files to Vendor - Invoice - Date.ext.",
     )
+    parser.add_argument(
+        "--move-to-done",
+        action="store_true",
+        help="Move matched receipts into a DONE subfolder, matching the finished-folder workflow.",
+    )
     return parser
 
 
@@ -509,7 +536,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Receipt folder not found: {receipts_dir}", file=sys.stderr)
         return 2
 
-    acquired, missing, renamed = audit_workbook(
+    acquired, missing, renamed, moved = audit_workbook(
         excel_path=excel_path,
         receipts_dir=receipts_dir,
         output_path=output_path,
@@ -517,12 +544,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         threshold=args.threshold,
         date_window_days=args.date_window_days,
         rename_receipts=args.rename_receipts,
+        move_to_done=args.move_to_done,
     )
     print(f"Saved audited workbook: {output_path}")
     print(f"Acquired: {acquired}")
     print(f"Missing: {missing}")
     if args.rename_receipts:
         print(f"Renamed receipts: {renamed}")
+    if args.move_to_done:
+        print(f"Moved to DONE: {moved}")
     return 0
 
 
