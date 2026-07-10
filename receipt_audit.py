@@ -6,6 +6,7 @@ import datetime as dt
 import logging
 import re
 import sys
+from io import BytesIO
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
@@ -15,9 +16,15 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 from openpyxl import load_workbook
 
 try:
-    from pypdf import PdfReader
+    from pypdf import PdfReader, PdfWriter
 except Exception:  # pragma: no cover - optional dependency at runtime
     PdfReader = None
+    PdfWriter = None
+
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover - optional dependency at runtime
+    Image = None
 
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 
@@ -233,6 +240,47 @@ def rename_receipt(charge: Charge, receipt: Receipt, target_dir: Optional[Path] 
     return new_path
 
 
+def merge_receipt_pdfs(receipt_paths: List[Path], output_path: Path) -> Tuple[int, List[Path]]:
+    if PdfReader is None or PdfWriter is None:
+        raise RuntimeError("pypdf is required to create the merged receipt PDF.")
+
+    writer = PdfWriter()
+    merged = 0
+    skipped = []
+
+    for path in receipt_paths:
+        suffix = path.suffix.lower()
+        try:
+            if suffix == ".pdf":
+                reader = PdfReader(str(path))
+                for page in reader.pages:
+                    writer.add_page(page)
+                merged += 1
+            elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"} and Image is not None:
+                with Image.open(path) as image:
+                    if getattr(image, "is_animated", False):
+                        image.seek(0)
+                    converted = image.convert("RGB")
+                    buffer = BytesIO()
+                    converted.save(buffer, format="PDF")
+                    buffer.seek(0)
+                    reader = PdfReader(buffer)
+                    for page in reader.pages:
+                        writer.add_page(page)
+                    merged += 1
+            else:
+                skipped.append(path)
+        except Exception:
+            skipped.append(path)
+
+    if merged:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("wb") as output_file:
+            writer.write(output_file)
+
+    return merged, skipped
+
+
 def merchant_score(merchant: str, text: str) -> float:
     merchant_clean = clean_text(merchant)
     if not merchant_clean:
@@ -428,7 +476,8 @@ def audit_workbook(
     date_window_days: int,
     rename_receipts: bool,
     move_to_done: bool = False,
-) -> Tuple[int, int, int, int]:
+    merged_pdf_path: Optional[Path] = None,
+) -> Tuple[int, int, int, int, int]:
     wb = load_workbook(excel_path)
     ws, header_row, columns = find_charge_sheet(wb, infer_target_year(excel_path))
     output_columns = ensure_output_columns(ws, header_row)
@@ -440,6 +489,7 @@ def audit_workbook(
     missing = 0
     renamed = 0
     moved = 0
+    matched_receipts = []
     used_receipts: Set[Path] = set()
     for charge in iter_charges(ws, header_row, columns):
         match = best_match(charge, receipts, threshold, date_window_days, used_receipts)
@@ -454,6 +504,7 @@ def audit_workbook(
                     if match.receipt.path.parent.resolve() != old_path.parent.resolve():
                         moved += 1
             used_receipts.add(match.receipt.path.resolve())
+            matched_receipts.append(match.receipt.path)
             if flag_column:
                 ws.cell(row=charge.row, column=flag_column).value = "yes"
             ws.cell(row=charge.row, column=output_columns[STATUS_HEADER]).value = "Acquired"
@@ -471,11 +522,23 @@ def audit_workbook(
         )
 
     wb.save(output_path)
-    return acquired, missing, renamed, moved
+    merged = 0
+    if merged_pdf_path and matched_receipts:
+        merged, skipped = merge_receipt_pdfs(matched_receipts, merged_pdf_path)
+        if skipped:
+            skipped_text = ", ".join(str(path) for path in skipped[:5])
+            if len(skipped) > 5:
+                skipped_text += f", and {len(skipped) - 5} more"
+            print(f"Skipped receipts that could not be merged: {skipped_text}", file=sys.stderr)
+    return acquired, missing, renamed, moved, merged
 
 
 def default_output_path(excel_path: Path) -> Path:
     return excel_path.with_name(f"{excel_path.stem}_receipt_audit{excel_path.suffix}")
+
+
+def default_merged_pdf_path(excel_path: Path) -> Path:
+    return excel_path.with_name(f"{excel_path.stem}_merged_receipts.pdf")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -520,6 +583,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Move matched receipts into a DONE subfolder, matching the finished-folder workflow.",
     )
+    parser.add_argument(
+        "--merged-pdf-output",
+        type=Path,
+        help="Where to save the combined PDF of acquired receipts. Defaults to *_merged_receipts.pdf.",
+    )
+    parser.add_argument(
+        "--no-merge-pdf",
+        action="store_true",
+        help="Do not create a combined PDF of acquired receipts.",
+    )
     return parser
 
 
@@ -528,6 +601,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     excel_path = args.excel.expanduser().resolve()
     receipts_dir = (args.receipts_dir or excel_path.parent).expanduser().resolve()
     output_path = (args.output or default_output_path(excel_path)).expanduser().resolve()
+    merged_pdf_path = None
+    if not args.no_merge_pdf:
+        merged_pdf_path = (args.merged_pdf_output or default_merged_pdf_path(excel_path)).expanduser().resolve()
 
     if not excel_path.exists():
         print(f"Excel file not found: {excel_path}", file=sys.stderr)
@@ -536,7 +612,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Receipt folder not found: {receipts_dir}", file=sys.stderr)
         return 2
 
-    acquired, missing, renamed, moved = audit_workbook(
+    acquired, missing, renamed, moved, merged = audit_workbook(
         excel_path=excel_path,
         receipts_dir=receipts_dir,
         output_path=output_path,
@@ -545,8 +621,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         date_window_days=args.date_window_days,
         rename_receipts=args.rename_receipts,
         move_to_done=args.move_to_done,
+        merged_pdf_path=merged_pdf_path,
     )
     print(f"Saved audited workbook: {output_path}")
+    if merged_pdf_path:
+        print(f"Saved merged receipt PDF: {merged_pdf_path}")
+        print(f"Merged receipts: {merged}")
     print(f"Acquired: {acquired}")
     print(f"Missing: {missing}")
     if args.rename_receipts:

@@ -57,6 +57,14 @@ The output defaults to a new file beside the workbook, such as:
 charges_receipt_audit.xlsx
 ```
 
+The checker also creates one combined PDF of all acquired receipts in workbook row order:
+
+```text
+charges_merged_receipts.pdf
+```
+
+Use `--no-merge-pdf` to skip this, or `--merged-pdf-output` to choose a different PDF path.
+
 ## Matching Notes
 
 The checker looks for:

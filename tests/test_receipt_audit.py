@@ -3,8 +3,16 @@ import unittest
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+from pypdf import PdfReader, PdfWriter
 
 from receipt_audit import audit_workbook
+
+
+def write_one_page_pdf(path: Path):
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    with path.open("wb") as output:
+        writer.write(output)
 
 
 class ReceiptAuditTests(unittest.TestCase):
@@ -23,7 +31,7 @@ class ReceiptAuditTests(unittest.TestCase):
 
             (folder / "20260601 Hotel Example 125.40.jpg").write_text("receipt", encoding="utf-8")
 
-            acquired, missing, renamed, moved = audit_workbook(
+            acquired, missing, renamed, moved, merged = audit_workbook(
                 excel_path=workbook_path,
                 receipts_dir=folder,
                 output_path=output_path,
@@ -37,6 +45,7 @@ class ReceiptAuditTests(unittest.TestCase):
             self.assertEqual(missing, 1)
             self.assertEqual(renamed, 0)
             self.assertEqual(moved, 0)
+            self.assertEqual(merged, 0)
 
             audited = load_workbook(output_path)
             ws = audited.active
@@ -65,7 +74,7 @@ class ReceiptAuditTests(unittest.TestCase):
 
             (folder / "2026_0603_GTLaw_#8106_$5,000.00.pdf").write_text("receipt", encoding="utf-8")
 
-            acquired, missing, renamed, moved = audit_workbook(
+            acquired, missing, renamed, moved, merged = audit_workbook(
                 excel_path=workbook_path,
                 receipts_dir=folder,
                 output_path=output_path,
@@ -79,6 +88,7 @@ class ReceiptAuditTests(unittest.TestCase):
             self.assertEqual(missing, 0)
             self.assertEqual(renamed, 0)
             self.assertEqual(moved, 0)
+            self.assertEqual(merged, 0)
 
             audited = load_workbook(output_path)
             ws = audited["Transaction Details"]
@@ -104,7 +114,7 @@ class ReceiptAuditTests(unittest.TestCase):
 
             (folder / "2026_0303_NEW VENDOR_#1234_$2.00.pdf").write_text("receipt", encoding="utf-8")
 
-            acquired, missing, renamed, moved = audit_workbook(
+            acquired, missing, renamed, moved, merged = audit_workbook(
                 excel_path=workbook_path,
                 receipts_dir=folder,
                 output_path=output_path,
@@ -118,6 +128,7 @@ class ReceiptAuditTests(unittest.TestCase):
             self.assertEqual(missing, 0)
             self.assertEqual(renamed, 0)
             self.assertEqual(moved, 0)
+            self.assertEqual(merged, 0)
 
             audited = load_workbook(output_path)
             self.assertEqual(audited["2026"]["D2"].value, "Acquired")
@@ -136,9 +147,9 @@ class ReceiptAuditTests(unittest.TestCase):
             wb.save(workbook_path)
 
             receipt_path = folder / "2026_0603_GTLaw_#8106_$5,000.00.pdf"
-            receipt_path.write_text("receipt", encoding="utf-8")
+            write_one_page_pdf(receipt_path)
 
-            acquired, missing, renamed, moved = audit_workbook(
+            acquired, missing, renamed, moved, merged = audit_workbook(
                 excel_path=workbook_path,
                 receipts_dir=folder,
                 output_path=output_path,
@@ -152,6 +163,7 @@ class ReceiptAuditTests(unittest.TestCase):
             self.assertEqual(missing, 0)
             self.assertEqual(renamed, 1)
             self.assertEqual(moved, 0)
+            self.assertEqual(merged, 0)
             renamed_path = folder / "GTLAW - 8106 - 2026-06-03.pdf"
             self.assertTrue(renamed_path.exists())
 
@@ -173,9 +185,9 @@ class ReceiptAuditTests(unittest.TestCase):
             wb.save(workbook_path)
 
             receipt_path = folder / "2026_0603_GTLaw_#8106_$5,000.00.pdf"
-            receipt_path.write_text("receipt", encoding="utf-8")
+            write_one_page_pdf(receipt_path)
 
-            acquired, missing, renamed, moved = audit_workbook(
+            acquired, missing, renamed, moved, merged = audit_workbook(
                 excel_path=workbook_path,
                 receipts_dir=folder,
                 output_path=output_path,
@@ -190,6 +202,7 @@ class ReceiptAuditTests(unittest.TestCase):
             self.assertEqual(missing, 1)
             self.assertEqual(renamed, 1)
             self.assertEqual(moved, 1)
+            self.assertEqual(merged, 0)
             self.assertFalse(receipt_path.exists())
 
             done_receipt = folder / "DONE" / "GTLAW - 8106 - 2026-06-03.pdf"
@@ -200,6 +213,42 @@ class ReceiptAuditTests(unittest.TestCase):
             self.assertEqual(ws["B2"].value, "yes")
             self.assertIsNone(ws["B3"].value)
             self.assertEqual(ws["F2"].value, "DONE\\GTLAW - 8106 - 2026-06-03.pdf")
+
+    def test_merges_acquired_receipts_into_single_pdf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            workbook_path = folder / "charges.xlsx"
+            output_path = folder / "audited.xlsx"
+            merged_path = folder / "merged.pdf"
+
+            wb = Workbook()
+            ws = wb.active
+            ws.append(["Date", "Vendor", "Amount"])
+            ws.append(["06/01/2026", "Hotel One", "125.40"])
+            ws.append(["06/02/2026", "Hotel Two", "225.40"])
+            wb.save(workbook_path)
+
+            write_one_page_pdf(folder / "2026_0601_Hotel One_#1001_$125.40.pdf")
+            write_one_page_pdf(folder / "2026_0602_Hotel Two_#1002_$225.40.pdf")
+
+            acquired, missing, renamed, moved, merged = audit_workbook(
+                excel_path=workbook_path,
+                receipts_dir=folder,
+                output_path=output_path,
+                recursive=True,
+                threshold=0.55,
+                date_window_days=3,
+                rename_receipts=False,
+                merged_pdf_path=merged_path,
+            )
+
+            self.assertEqual(acquired, 2)
+            self.assertEqual(missing, 0)
+            self.assertEqual(renamed, 0)
+            self.assertEqual(moved, 0)
+            self.assertEqual(merged, 2)
+            self.assertTrue(merged_path.exists())
+            self.assertEqual(len(PdfReader(str(merged_path)).pages), 2)
 
 
 if __name__ == "__main__":
