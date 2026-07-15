@@ -250,6 +250,98 @@ class ReceiptAuditTests(unittest.TestCase):
             self.assertTrue(merged_path.exists())
             self.assertEqual(len(PdfReader(str(merged_path)).pages), 2)
 
+    def test_does_not_match_wrong_cents_with_same_dollars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            workbook_path = folder / "charges.xlsx"
+            output_path = folder / "audited.xlsx"
+
+            wb = Workbook()
+            ws = wb.active
+            ws.append(["Date", "Vendor", "Amount"])
+            ws.append(["06/01/2026", "Hotel Example", "125.40"])
+            wb.save(workbook_path)
+
+            write_one_page_pdf(folder / "2026_0601_Hotel Example_#1001_$125.99.pdf")
+
+            acquired, missing, renamed, moved, merged = audit_workbook(
+                excel_path=workbook_path,
+                receipts_dir=folder,
+                output_path=output_path,
+                recursive=True,
+                threshold=0.55,
+                date_window_days=3,
+                rename_receipts=False,
+            )
+
+            self.assertEqual(acquired, 0)
+            self.assertEqual(missing, 1)
+            self.assertEqual(renamed, 0)
+            self.assertEqual(moved, 0)
+            self.assertEqual(merged, 0)
+
+    def test_ignores_previous_merged_receipt_pdf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            workbook_path = folder / "charges.xlsx"
+            output_path = folder / "audited.xlsx"
+
+            wb = Workbook()
+            ws = wb.active
+            ws.append(["Date", "Vendor", "Amount"])
+            ws.append(["06/01/2026", "Hotel Example", "125.40"])
+            wb.save(workbook_path)
+
+            write_one_page_pdf(folder / "charges_merged_receipts.pdf")
+
+            acquired, missing, renamed, moved, merged = audit_workbook(
+                excel_path=workbook_path,
+                receipts_dir=folder,
+                output_path=output_path,
+                recursive=True,
+                threshold=0.55,
+                date_window_days=3,
+                rename_receipts=False,
+            )
+
+            self.assertEqual(acquired, 0)
+            self.assertEqual(missing, 1)
+            self.assertEqual(renamed, 0)
+            self.assertEqual(moved, 0)
+            self.assertEqual(merged, 0)
+
+    def test_removes_stale_merged_pdf_when_no_receipts_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            workbook_path = folder / "charges.xlsx"
+            output_path = folder / "audited.xlsx"
+            merged_path = folder / "merged.pdf"
+
+            wb = Workbook()
+            ws = wb.active
+            ws.append(["Date", "Vendor", "Amount"])
+            ws.append(["06/01/2026", "No Receipt Vendor", "125.40"])
+            wb.save(workbook_path)
+            write_one_page_pdf(merged_path)
+
+            acquired, missing, renamed, moved, merged = audit_workbook(
+                excel_path=workbook_path,
+                receipts_dir=folder,
+                output_path=output_path,
+                recursive=True,
+                threshold=0.55,
+                date_window_days=3,
+                rename_receipts=False,
+                merged_pdf_path=merged_path,
+            )
+
+            self.assertEqual(acquired, 0)
+            self.assertEqual(missing, 1)
+            self.assertEqual(renamed, 0)
+            self.assertEqual(moved, 0)
+            self.assertEqual(merged, 0)
+            self.assertFalse(merged_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

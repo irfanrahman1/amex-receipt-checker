@@ -72,6 +72,9 @@ class Charge:
 class Receipt:
     path: Path
     searchable_text: str
+    dates: List[dt.date]
+    amounts: Set[Decimal]
+    filename_amounts: Set[Decimal]
 
 
 @dataclass
@@ -157,6 +160,21 @@ def extract_dates(text: str) -> List[dt.date]:
         except ValueError:
             pass
     return sorted(dates)
+
+
+def extract_amounts(text: str) -> Set[Decimal]:
+    amounts: Set[Decimal] = set()
+    normalized = text.replace(",", "")
+    patterns = (
+        r"(?<!\d)\$?\s*(-?\d+\.\d{1,2})(?!\d)",
+        r"\((\$?\s*\d+\.\d{1,2})\)",
+    )
+    for pattern in patterns:
+        for match in re.findall(pattern, normalized):
+            amount = parse_amount(match)
+            if amount is not None:
+                amounts.add(amount)
+    return amounts
 
 
 def amount_tokens(value: Optional[Decimal]) -> List[str]:
@@ -277,6 +295,8 @@ def merge_receipt_pdfs(receipt_paths: List[Path], output_path: Path) -> Tuple[in
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("wb") as output_file:
             writer.write(output_file)
+    elif output_path.exists():
+        output_path.unlink()
 
     return merged, skipped
 
@@ -320,10 +340,22 @@ def load_receipts(folder: Path, excel_path: Path, recursive: bool) -> List[Recei
             continue
         if path.suffix.lower() not in RECEIPT_EXTENSIONS:
             continue
+        if clean_text(path.stem).endswith("merged receipts"):
+            continue
         text = path.stem
         if path.suffix.lower() == ".pdf":
             text = f"{text} {extract_pdf_text(path)}"
-        receipts.append(Receipt(path=path, searchable_text=clean_text(text)))
+        searchable_text = clean_text(text)
+        filename_amounts = extract_amounts(path.stem)
+        receipts.append(
+            Receipt(
+                path=path,
+                searchable_text=searchable_text,
+                dates=extract_dates(searchable_text),
+                amounts=extract_amounts(text),
+                filename_amounts=filename_amounts,
+            )
+        )
     return receipts
 
 
@@ -422,17 +454,19 @@ def score_receipt(charge: Charge, receipt: Receipt, date_window_days: int) -> Tu
     score = 0.0
     notes = []
 
-    amount_hit = any(token and token in text for token in amount_tokens(charge.amount))
+    amount_hit = charge.amount is not None and charge.amount in receipt.amounts
     if amount_hit:
         score += 0.45
         notes.append("amount")
+    elif charge.amount is not None and receipt.filename_amounts:
+        return 0.0, ["filename amount mismatch"]
 
     date_hit = any(token and clean_text(token) in text for token in date_tokens(charge.date))
     if date_hit:
         score += 0.20
         notes.append("date")
     elif charge.date and date_window_days > 0:
-        receipt_dates = extract_dates(text)
+        receipt_dates = receipt.dates
         if receipt_dates:
             closest_days = min(abs((receipt_date - charge.date).days) for receipt_date in receipt_dates)
             if closest_days <= date_window_days:
@@ -523,7 +557,7 @@ def audit_workbook(
 
     wb.save(output_path)
     merged = 0
-    if merged_pdf_path and matched_receipts:
+    if merged_pdf_path:
         merged, skipped = merge_receipt_pdfs(matched_receipts, merged_pdf_path)
         if skipped:
             skipped_text = ", ".join(str(path) for path in skipped[:5])
