@@ -1,14 +1,24 @@
 # AmEx Receipt Checker
 
-This is a small Python utility for auditing an American Express charge workbook against receipt files in the same folder.
+AmEx Receipt Checker is a Python utility that audits an American Express transaction workbook against receipt files in the same folder tree.
 
-It opens the Excel file, looks for charge rows, checks receipt filenames and text-based PDFs in the receipt folder, and writes a copy of the workbook with these columns:
+It helps answer one practical question: **which charges already have receipts, and which ones still need follow-up?**
 
-- `Receipt Status`: `Acquired` or `Missing`
-- `Matched Receipt`: the receipt file that matched
-- `Receipt Match Notes`: the score and signals used for the match
+## What It Does
 
-The original workbook is not overwritten unless you explicitly pass it as `--output`.
+The program:
+
+- opens an AmEx Excel transaction workbook
+- finds the correct transaction sheet automatically
+- scans the receipt folder and subfolders
+- matches receipts using amount, date, and vendor text
+- allows a date window for late-posted AmEx charges
+- writes a new audited Excel workbook
+- optionally renames matched receipts
+- optionally moves matched receipts into a `DONE` folder
+- creates one merged PDF of all acquired receipts
+
+The original workbook is not overwritten unless you explicitly choose the same output path.
 
 ## Setup
 
@@ -17,30 +27,26 @@ python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-## Run
-
-If the workbook is inside the same folder as the receipts:
+## Basic Run
 
 ```powershell
-.\.venv\Scripts\python receipt_audit.py "C:\Path\To\AP Interns 2026\Margaret Jing\American Express\charges.xlsx"
+.\.venv\Scripts\python receipt_audit.py "C:\Path\To\AMEX Transaction Details.xlsx"
 ```
+
+By default, receipts are searched in the same folder as the workbook.
 
 If receipts are in a different folder:
 
 ```powershell
-.\.venv\Scripts\python receipt_audit.py "C:\Path\To\charges.xlsx" --receipts-dir "C:\Path\To\Receipts"
+.\.venv\Scripts\python receipt_audit.py "C:\Path\To\AMEX Transaction Details.xlsx" --receipts-dir "C:\Path\To\Receipts"
 ```
 
-To also rename matched receipts:
+## Finished-Folder Workflow
+
+To match the completed manual workflow, rename matched receipts and move them into `DONE`:
 
 ```powershell
-.\.venv\Scripts\python receipt_audit.py "C:\Path\To\charges.xlsx" --receipts-dir "C:\Path\To\Receipts" --rename-receipts
-```
-
-To match the finished-folder workflow, rename matched receipts and move them into `DONE`:
-
-```powershell
-.\.venv\Scripts\python receipt_audit.py "C:\Path\To\charges.xlsx" --receipts-dir "C:\Path\To\Receipts" --rename-receipts --move-to-done
+.\.venv\Scripts\python receipt_audit.py "C:\Path\To\AMEX Transaction Details.xlsx" --receipts-dir "C:\Path\To\Month Folder" --rename-receipts --move-to-done
 ```
 
 Renamed receipts use this format:
@@ -49,37 +55,79 @@ Renamed receipts use this format:
 Vendor - Invoice - Date.ext
 ```
 
-When the workbook already has a `Receipt` column, acquired rows are marked `yes` and missing rows are left blank, matching the manual review format.
-
-The output defaults to a new file beside the workbook, such as:
+Example:
 
 ```text
-charges_receipt_audit.xlsx
+Example Cloud - INV-1001 - 2026-07-01.pdf
 ```
 
-The checker also creates one combined PDF of all acquired receipts in workbook row order:
+## Outputs
+
+The program creates an audited workbook:
 
 ```text
-charges_merged_receipts.pdf
+AMEX Transaction Details_receipt_audit.xlsx
 ```
 
-Use `--no-merge-pdf` to skip this, or `--merged-pdf-output` to choose a different PDF path.
+It adds these columns:
 
-## Matching Notes
+- `Receipt Status`
+- `Matched Receipt`
+- `Receipt Match Notes`
 
-The checker looks for:
+Rows are marked:
 
-- charge amount
-- charge date
-- merchant or description text
+- `Acquired` when a matching receipt is found
+- `Missing` when no strong receipt match is found
 
-By default, receipt dates can be up to 3 days before or after the workbook date. This helps when AmEx posts a charge later than the actual receipt date. Change this with `--date-window-days`.
+If the workbook already has a `Receipt` column, acquired rows are marked `yes` and missing rows are left blank.
 
-It scans common receipt formats including PDF, PNG, JPG, JPEG, HEIC, WEBP, TIF, and TIFF. For PDFs, it can read embedded text when the PDF contains text. Scanned image-only PDFs and photos are matched by filename only.
+The program also creates a merged PDF of acquired receipts:
 
-If the workbook headers are unusual, rename them to common labels such as `Date`, `Description`, and `Amount`.
+```text
+AMEX Transaction Details_merged_receipts.pdf
+```
 
-The workbook does not need to open directly on the transaction sheet. The checker searches worksheets for transaction-style headers and prefers a sheet named `Transaction Details` when present.
+To skip the merged PDF:
+
+```powershell
+.\.venv\Scripts\python receipt_audit.py "C:\Path\To\AMEX Transaction Details.xlsx" --no-merge-pdf
+```
+
+## Matching Rules
+
+The matcher checks:
+
+- exact charge amount when an amount is available
+- transaction date, with a default 3-day date window
+- vendor or description text
+
+The date window helps when the receipt date and AmEx posted date are a few days apart.
+
+Change the date window with:
+
+```powershell
+--date-window-days 5
+```
+
+## Example
+
+This repository includes one sanitized before/after example:
+
+```text
+examples/before/example_charges_before.xlsx
+examples/after/example_charges_after.xlsx
+```
+
+The example also includes:
+
+```text
+examples/before/receipts/
+examples/after/DONE/
+examples/after/example_acquired_receipts.pdf
+```
+
+The example uses fake data only.
 
 ## Tests
 
