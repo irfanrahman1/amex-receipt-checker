@@ -2,6 +2,7 @@
 """Audit an AmEx charge workbook against receipt files in the same folder."""
 
 import argparse
+import csv
 import datetime as dt
 import logging
 import re
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 
 try:
     from pypdf import PdfReader, PdfWriter
@@ -22,9 +24,16 @@ except Exception:  # pragma: no cover - optional dependency at runtime
     PdfWriter = None
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw, ImageFont
 except Exception:  # pragma: no cover - optional dependency at runtime
     Image = None
+    ImageDraw = None
+    ImageFont = None
+
+try:
+    import pytesseract
+except Exception:  # pragma: no cover - optional dependency at runtime
+    pytesseract = None
 
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 
@@ -58,6 +67,14 @@ STATUS_HEADER = "Receipt Status"
 MATCH_HEADER = "Matched Receipt"
 NOTES_HEADER = "Receipt Match Notes"
 RECEIPT_FLAG_HEADER = "Receipt"
+ACQUIRED_STATUS = "Acquired"
+NEEDS_REVIEW_STATUS = "Needs Review"
+MISSING_STATUS = "Missing"
+STATUS_COLORS = {
+    ACQUIRED_STATUS: "C6EFCE",
+    NEEDS_REVIEW_STATUS: "FFEB9C",
+    MISSING_STATUS: "FFC7CE",
+}
 
 
 @dataclass
@@ -82,6 +99,7 @@ class Match:
     receipt: Optional[Receipt]
     score: float
     notes: str
+    status: str = MISSING_STATUS
 
 
 def clean_text(value: object) -> str:
@@ -258,13 +276,25 @@ def rename_receipt(charge: Charge, receipt: Receipt, target_dir: Optional[Path] 
     return new_path
 
 
-def merge_receipt_pdfs(receipt_paths: List[Path], output_path: Path) -> Tuple[int, List[Path]]:
+def merge_receipt_pdfs(
+    receipt_paths: List[Path],
+    output_path: Path,
+    receipt_labels: Optional[List[str]] = None,
+) -> Tuple[int, List[Path]]:
     if PdfReader is None or PdfWriter is None:
         raise RuntimeError("pypdf is required to create the merged receipt PDF.")
 
     writer = PdfWriter()
     merged = 0
     skipped = []
+    if receipt_paths:
+        labels = receipt_labels or [path.name for path in receipt_paths]
+        cover = PdfReader(pdf_text_page("AmEx Receipt Packet", [f"Total matched receipts: {len(receipt_paths)}"]))
+        writer.add_page(cover.pages[0])
+        toc_lines = [f"{index + 1}. {label}" for index, label in enumerate(labels)]
+        for start in range(0, len(toc_lines), 34):
+            toc = PdfReader(pdf_text_page("Receipt Table of Contents", toc_lines[start : start + 34]))
+            writer.add_page(toc.pages[0])
 
     for path in receipt_paths:
         suffix = path.suffix.lower()
@@ -319,18 +349,34 @@ def merchant_score(merchant: str, text: str) -> float:
     return max(word_score, ratio)
 
 
-def extract_pdf_text(path: Path) -> str:
-    if PdfReader is None:
+def ocr_image_text(path: Path, enabled: bool) -> str:
+    if not enabled or Image is None or pytesseract is None:
         return ""
     try:
-        reader = PdfReader(str(path))
-        pages = reader.pages[:3]
-        return " ".join(page.extract_text() or "" for page in pages)
+        with Image.open(path) as image:
+            if getattr(image, "is_animated", False):
+                image.seek(0)
+            return pytesseract.image_to_string(image)
     except Exception:
         return ""
 
 
-def load_receipts(folder: Path, excel_path: Path, recursive: bool) -> List[Receipt]:
+def extract_pdf_text(path: Path, ocr_enabled: bool = False) -> str:
+    if PdfReader is None:
+        return ""
+    text = ""
+    try:
+        reader = PdfReader(str(path))
+        pages = reader.pages[:3]
+        text = " ".join(page.extract_text() or "" for page in pages)
+    except Exception:
+        text = ""
+    # Optional OCR for PDFs is intentionally conservative. We avoid a hard dependency
+    # on system PDF rendering tools and only OCR image files directly.
+    return text
+
+
+def load_receipts(folder: Path, excel_path: Path, recursive: bool, ocr_enabled: bool = False) -> List[Receipt]:
     pattern = "**/*" if recursive else "*"
     receipts = []
     for path in folder.glob(pattern):
@@ -344,7 +390,9 @@ def load_receipts(folder: Path, excel_path: Path, recursive: bool) -> List[Recei
             continue
         text = path.stem
         if path.suffix.lower() == ".pdf":
-            text = f"{text} {extract_pdf_text(path)}"
+            text = f"{text} {extract_pdf_text(path, ocr_enabled)}"
+        elif path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}:
+            text = f"{text} {ocr_image_text(path, ocr_enabled)}"
         searchable_text = clean_text(text)
         filename_amounts = extract_amounts(path.stem)
         receipts.append(
@@ -485,20 +533,97 @@ def best_match(
     charge: Charge,
     receipts: List[Receipt],
     threshold: float,
+    review_threshold: float,
     date_window_days: int,
     used_receipts: Set[Path],
 ) -> Match:
     best = Match(receipt=None, score=0.0, notes="")
+    strong_candidates = 0
     for receipt in receipts:
         if receipt.path.resolve() in used_receipts:
             continue
         score, notes = score_receipt(charge, receipt, date_window_days)
+        if score >= threshold:
+            strong_candidates += 1
         if score > best.score:
             best = Match(receipt=receipt, score=score, notes=", ".join(notes))
 
+    if strong_candidates > 1:
+        best.notes = f"{best.notes}; duplicate candidate receipts: {strong_candidates}"
+        if best.score < 0.85:
+            best.status = NEEDS_REVIEW_STATUS
+            return best
+
     if best.receipt is not None and best.score >= threshold:
+        best.status = ACQUIRED_STATUS
         return best
-    return Match(receipt=None, score=best.score, notes=best.notes or "no strong match")
+    if best.receipt is not None and best.score >= review_threshold:
+        best.status = NEEDS_REVIEW_STATUS
+        return best
+    return Match(receipt=None, score=best.score, notes=best.notes or "no strong match", status=MISSING_STATUS)
+
+
+def apply_status_style(ws, row: int, status_col: int, status: str):
+    color = STATUS_COLORS.get(status)
+    if not color:
+        return
+    cell = ws.cell(row=row, column=status_col)
+    cell.fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+
+
+def write_reports(
+    report_path: Path,
+    unmatched_path: Path,
+    rows: List[Dict[str, str]],
+    receipts: List[Receipt],
+    used_receipts: Set[Path],
+):
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "row",
+        "status",
+        "date",
+        "merchant",
+        "amount",
+        "matched_receipt",
+        "score",
+        "notes",
+    ]
+    with report_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    with unmatched_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["receipt"])
+        writer.writeheader()
+        for receipt in receipts:
+            if receipt.path.resolve() not in used_receipts:
+                writer.writerow({"receipt": str(receipt.path)})
+
+
+def pdf_text_page(title: str, lines: List[str]) -> BytesIO:
+    if Image is None:
+        raise RuntimeError("Pillow is required to create merged PDF cover pages.")
+    width, height = 1700, 2200
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    try:
+        title_font = ImageFont.truetype("arialbd.ttf", 54)
+        body_font = ImageFont.truetype("arial.ttf", 32)
+    except Exception:
+        title_font = body_font = ImageFont.load_default()
+    draw.text((90, 90), title, fill=(25, 35, 50), font=title_font)
+    y = 190
+    for line in lines:
+        draw.text((90, y), line[:95], fill=(35, 35, 35), font=body_font)
+        y += 52
+        if y > height - 100:
+            break
+    buffer = BytesIO()
+    image.save(buffer, format="PDF")
+    buffer.seek(0)
+    return buffer
 
 
 def audit_workbook(
@@ -507,27 +632,34 @@ def audit_workbook(
     output_path: Path,
     recursive: bool,
     threshold: float,
+    review_threshold: float,
     date_window_days: int,
     rename_receipts: bool,
     move_to_done: bool = False,
     merged_pdf_path: Optional[Path] = None,
-) -> Tuple[int, int, int, int, int]:
+    report_path: Optional[Path] = None,
+    unmatched_report_path: Optional[Path] = None,
+    ocr_enabled: bool = False,
+) -> Tuple[int, int, int, int, int, int]:
     wb = load_workbook(excel_path)
     ws, header_row, columns = find_charge_sheet(wb, infer_target_year(excel_path))
     output_columns = ensure_output_columns(ws, header_row)
     flag_column = receipt_flag_column(ws, header_row)
-    receipts = load_receipts(receipts_dir, excel_path, recursive)
+    receipts = load_receipts(receipts_dir, excel_path, recursive, ocr_enabled=ocr_enabled)
     done_dir = receipts_dir / "DONE" if move_to_done else None
 
     acquired = 0
     missing = 0
+    needs_review = 0
     renamed = 0
     moved = 0
     matched_receipts = []
+    matched_labels = []
+    report_rows: List[Dict[str, str]] = []
     used_receipts: Set[Path] = set()
     for charge in iter_charges(ws, header_row, columns):
-        match = best_match(charge, receipts, threshold, date_window_days, used_receipts)
-        if match.receipt:
+        match = best_match(charge, receipts, threshold, review_threshold, date_window_days, used_receipts)
+        if match.status == ACQUIRED_STATUS and match.receipt:
             acquired += 1
             old_path = match.receipt.path
             if rename_receipts or move_to_done:
@@ -539,9 +671,21 @@ def audit_workbook(
                         moved += 1
             used_receipts.add(match.receipt.path.resolve())
             matched_receipts.append(match.receipt.path)
+            matched_labels.append(
+                f"Row {charge.row}: {charge.date or ''} | {charge.merchant} | "
+                f"{charge.amount or ''} | {match.receipt.path.name}"
+            )
             if flag_column:
                 ws.cell(row=charge.row, column=flag_column).value = "yes"
-            ws.cell(row=charge.row, column=output_columns[STATUS_HEADER]).value = "Acquired"
+            ws.cell(row=charge.row, column=output_columns[STATUS_HEADER]).value = ACQUIRED_STATUS
+            ws.cell(row=charge.row, column=output_columns[MATCH_HEADER]).value = str(
+                match.receipt.path.relative_to(receipts_dir)
+            )
+        elif match.status == NEEDS_REVIEW_STATUS and match.receipt:
+            needs_review += 1
+            if flag_column:
+                ws.cell(row=charge.row, column=flag_column).value = ""
+            ws.cell(row=charge.row, column=output_columns[STATUS_HEADER]).value = NEEDS_REVIEW_STATUS
             ws.cell(row=charge.row, column=output_columns[MATCH_HEADER]).value = str(
                 match.receipt.path.relative_to(receipts_dir)
             )
@@ -549,22 +693,44 @@ def audit_workbook(
             missing += 1
             if flag_column:
                 ws.cell(row=charge.row, column=flag_column).value = ""
-            ws.cell(row=charge.row, column=output_columns[STATUS_HEADER]).value = "Missing"
+            ws.cell(row=charge.row, column=output_columns[STATUS_HEADER]).value = MISSING_STATUS
             ws.cell(row=charge.row, column=output_columns[MATCH_HEADER]).value = ""
         ws.cell(row=charge.row, column=output_columns[NOTES_HEADER]).value = (
             f"score {match.score:.2f}; {match.notes}"
+        )
+        status = ws.cell(row=charge.row, column=output_columns[STATUS_HEADER]).value
+        apply_status_style(ws, charge.row, output_columns[STATUS_HEADER], status)
+        report_rows.append(
+            {
+                "row": str(charge.row),
+                "status": str(status),
+                "date": str(charge.date or ""),
+                "merchant": charge.merchant,
+                "amount": str(charge.amount or ""),
+                "matched_receipt": str(ws.cell(row=charge.row, column=output_columns[MATCH_HEADER]).value or ""),
+                "score": f"{match.score:.2f}",
+                "notes": match.notes,
+            }
         )
 
     wb.save(output_path)
     merged = 0
     if merged_pdf_path:
-        merged, skipped = merge_receipt_pdfs(matched_receipts, merged_pdf_path)
+        merged, skipped = merge_receipt_pdfs(matched_receipts, merged_pdf_path, matched_labels)
         if skipped:
             skipped_text = ", ".join(str(path) for path in skipped[:5])
             if len(skipped) > 5:
                 skipped_text += f", and {len(skipped) - 5} more"
             print(f"Skipped receipts that could not be merged: {skipped_text}", file=sys.stderr)
-    return acquired, missing, renamed, moved, merged
+    if report_path:
+        write_reports(
+            report_path,
+            unmatched_report_path or report_path.with_name(f"{report_path.stem}_unmatched_receipts.csv"),
+            report_rows,
+            receipts,
+            used_receipts,
+        )
+    return acquired, needs_review, missing, renamed, moved, merged
 
 
 def default_output_path(excel_path: Path) -> Path:
@@ -575,11 +741,82 @@ def default_merged_pdf_path(excel_path: Path) -> Path:
     return excel_path.with_name(f"{excel_path.stem}_merged_receipts.pdf")
 
 
+def default_report_path(excel_path: Path) -> Path:
+    return excel_path.with_name(f"{excel_path.stem}_audit_report.csv")
+
+
+def candidate_workbooks(root: Path) -> List[Path]:
+    workbooks = []
+    for path in root.rglob("*.xlsx"):
+        name = path.name.lower()
+        if "receipt_audit" in name or name.startswith("~$"):
+            continue
+        if "transaction details" in name:
+            workbooks.append(path)
+    return sorted(workbooks)
+
+
+def run_single(args, excel_path: Path) -> Tuple[int, int, int, int, int, int]:
+    receipts_dir = (args.receipts_dir or excel_path.parent).expanduser().resolve()
+    output_path = (
+        args.output.expanduser().resolve()
+        if args.output and not args.batch_root
+        else default_output_path(excel_path).resolve()
+    )
+    merged_pdf_path = None
+    if not args.no_merge_pdf:
+        merged_pdf_path = (
+            args.merged_pdf_output.expanduser().resolve()
+            if args.merged_pdf_output and not args.batch_root
+            else default_merged_pdf_path(excel_path).resolve()
+        )
+    report_path = None
+    unmatched_path = None
+    if not args.no_reports:
+        report_path = (
+            args.report_output.expanduser().resolve()
+            if args.report_output and not args.batch_root
+            else default_report_path(excel_path).resolve()
+        )
+        unmatched_path = report_path.with_name(f"{report_path.stem}_unmatched_receipts.csv")
+
+    acquired, needs_review, missing, renamed, moved, merged = audit_workbook(
+        excel_path=excel_path,
+        receipts_dir=receipts_dir,
+        output_path=output_path,
+        recursive=not args.no_recursive,
+        threshold=args.threshold,
+        review_threshold=args.review_threshold,
+        date_window_days=args.date_window_days,
+        rename_receipts=args.rename_receipts,
+        move_to_done=args.move_to_done,
+        merged_pdf_path=merged_pdf_path,
+        report_path=report_path,
+        unmatched_report_path=unmatched_path,
+        ocr_enabled=args.ocr,
+    )
+    print(f"Saved audited workbook: {output_path}")
+    if merged_pdf_path:
+        print(f"Saved merged receipt PDF: {merged_pdf_path}")
+        print(f"Merged receipts: {merged}")
+    if report_path:
+        print(f"Saved audit report: {report_path}")
+        print(f"Saved unmatched receipts report: {unmatched_path}")
+    print(f"Acquired: {acquired}")
+    print(f"Needs review: {needs_review}")
+    print(f"Missing: {missing}")
+    if args.rename_receipts:
+        print(f"Renamed receipts: {renamed}")
+    if args.move_to_done:
+        print(f"Moved to DONE: {moved}")
+    return acquired, needs_review, missing, renamed, moved, merged
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Mark AmEx workbook charges as Acquired or Missing based on receipt files."
     )
-    parser.add_argument("excel", type=Path, help="Path to the AmEx Excel workbook.")
+    parser.add_argument("excel", nargs="?", type=Path, help="Path to the AmEx Excel workbook.")
     parser.add_argument(
         "--receipts-dir",
         type=Path,
@@ -600,6 +837,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.55,
         help="Match threshold from 0.0 to 1.0. Default: 0.55.",
+    )
+    parser.add_argument(
+        "--review-threshold",
+        type=float,
+        default=0.40,
+        help="Score from this value to --threshold is marked Needs Review. Default: 0.40.",
     )
     parser.add_argument(
         "--date-window-days",
@@ -627,46 +870,130 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not create a combined PDF of acquired receipts.",
     )
+    parser.add_argument(
+        "--report-output",
+        type=Path,
+        help="Where to save the CSV audit report. Defaults to *_audit_report.csv.",
+    )
+    parser.add_argument(
+        "--no-reports",
+        action="store_true",
+        help="Do not create CSV audit and unmatched receipt reports.",
+    )
+    parser.add_argument(
+        "--ocr",
+        action="store_true",
+        help="Use OCR for image receipts when pytesseract and Tesseract are installed.",
+    )
+    parser.add_argument(
+        "--batch-root",
+        type=Path,
+        help="Process every *Transaction Details.xlsx workbook under this root.",
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Open a simple file-picker interface.",
+    )
     return parser
+
+
+def run_gui() -> int:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox
+    except Exception as exc:
+        print(f"GUI is unavailable: {exc}", file=sys.stderr)
+        return 2
+
+    root = tk.Tk()
+    root.withdraw()
+    excel = filedialog.askopenfilename(
+        title="Choose AmEx workbook",
+        filetypes=[("Excel workbooks", "*.xlsx *.xlsm *.xls"), ("All files", "*.*")],
+    )
+    if not excel:
+        return 1
+    receipts_dir = filedialog.askdirectory(title="Choose receipt folder")
+    if not receipts_dir:
+        return 1
+    excel_path = Path(excel).resolve()
+    receipts_path = Path(receipts_dir).resolve()
+    acquired, needs_review, missing, renamed, moved, merged = audit_workbook(
+        excel_path=excel_path,
+        receipts_dir=receipts_path,
+        output_path=default_output_path(excel_path),
+        recursive=True,
+        threshold=0.55,
+        review_threshold=0.40,
+        date_window_days=3,
+        rename_receipts=True,
+        move_to_done=True,
+        merged_pdf_path=default_merged_pdf_path(excel_path),
+        report_path=default_report_path(excel_path),
+    )
+    messagebox.showinfo(
+        "AmEx Receipt Checker",
+        (
+            f"Audit complete.\n\n"
+            f"Acquired: {acquired}\n"
+            f"Needs review: {needs_review}\n"
+            f"Missing: {missing}\n"
+            f"Renamed: {renamed}\n"
+            f"Moved to DONE: {moved}\n"
+            f"Merged receipts: {merged}"
+        ),
+    )
+    return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.gui:
+        return run_gui()
+
+    if args.batch_root:
+        root = args.batch_root.expanduser().resolve()
+        if not root.exists():
+            print(f"Batch root not found: {root}", file=sys.stderr)
+            return 2
+        workbooks = candidate_workbooks(root)
+        if not workbooks:
+            print(f"No transaction workbooks found under: {root}", file=sys.stderr)
+            return 2
+        total_acquired = total_needs_review = total_missing = total_renamed = total_moved = total_merged = 0
+        for workbook in workbooks:
+            print(f"\nProcessing: {workbook}")
+            acquired, needs_review, missing, renamed, moved, merged = run_single(args, workbook)
+            total_acquired += acquired
+            total_needs_review += needs_review
+            total_missing += missing
+            total_renamed += renamed
+            total_moved += moved
+            total_merged += merged
+        print("\nBatch complete")
+        print(f"Total acquired: {total_acquired}")
+        print(f"Total needs review: {total_needs_review}")
+        print(f"Total missing: {total_missing}")
+        print(f"Total renamed: {total_renamed}")
+        print(f"Total moved to DONE: {total_moved}")
+        print(f"Total merged receipts: {total_merged}")
+        return 0
+
+    if not args.excel:
+        print("Excel workbook path is required unless --batch-root or --gui is used.", file=sys.stderr)
+        return 2
+
     excel_path = args.excel.expanduser().resolve()
-    receipts_dir = (args.receipts_dir or excel_path.parent).expanduser().resolve()
-    output_path = (args.output or default_output_path(excel_path)).expanduser().resolve()
-    merged_pdf_path = None
-    if not args.no_merge_pdf:
-        merged_pdf_path = (args.merged_pdf_output or default_merged_pdf_path(excel_path)).expanduser().resolve()
 
     if not excel_path.exists():
         print(f"Excel file not found: {excel_path}", file=sys.stderr)
         return 2
-    if not receipts_dir.exists():
-        print(f"Receipt folder not found: {receipts_dir}", file=sys.stderr)
+    if args.receipts_dir and not args.receipts_dir.expanduser().resolve().exists():
+        print(f"Receipt folder not found: {args.receipts_dir}", file=sys.stderr)
         return 2
 
-    acquired, missing, renamed, moved, merged = audit_workbook(
-        excel_path=excel_path,
-        receipts_dir=receipts_dir,
-        output_path=output_path,
-        recursive=not args.no_recursive,
-        threshold=args.threshold,
-        date_window_days=args.date_window_days,
-        rename_receipts=args.rename_receipts,
-        move_to_done=args.move_to_done,
-        merged_pdf_path=merged_pdf_path,
-    )
-    print(f"Saved audited workbook: {output_path}")
-    if merged_pdf_path:
-        print(f"Saved merged receipt PDF: {merged_pdf_path}")
-        print(f"Merged receipts: {merged}")
-    print(f"Acquired: {acquired}")
-    print(f"Missing: {missing}")
-    if args.rename_receipts:
-        print(f"Renamed receipts: {renamed}")
-    if args.move_to_done:
-        print(f"Moved to DONE: {moved}")
+    run_single(args, excel_path)
     return 0
 
 

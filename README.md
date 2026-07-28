@@ -14,9 +14,13 @@ The program:
 - matches receipts using amount, date, and vendor text
 - allows a date window for late-posted AmEx charges
 - writes a new audited Excel workbook
+- color-codes each row by status
+- creates CSV review reports
 - optionally renames matched receipts
 - optionally moves matched receipts into a `DONE` folder
-- creates one merged PDF of all acquired receipts
+- optionally uses OCR on image receipts
+- creates one merged PDF packet of all acquired receipts with a cover page and table of contents
+- can process one workbook, a whole folder batch, or a simple file-picker GUI
 
 The original workbook is not overwritten unless you explicitly choose the same output path.
 
@@ -26,6 +30,8 @@ The original workbook is not overwritten unless you explicitly choose the same o
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 ```
+
+OCR is optional. To use `--ocr`, install the Tesseract app for Windows in addition to the Python requirements.
 
 ## Basic Run
 
@@ -78,15 +84,27 @@ It adds these columns:
 Rows are marked:
 
 - `Acquired` when a matching receipt is found
+- `Needs Review` when the program found a possible receipt but the match is not strong enough to trust automatically
 - `Missing` when no strong receipt match is found
 
 If the workbook already has a `Receipt` column, acquired rows are marked `yes` and missing rows are left blank.
 
-The program also creates a merged PDF of acquired receipts:
+The program also creates these files:
+
+```text
+AMEX Transaction Details_audit_report.csv
+AMEX Transaction Details_audit_report_unmatched_receipts.csv
+```
+
+The audit report lists every charge, its status, score, matched receipt, and match notes. The unmatched receipt report lists receipt files that were not used by any acquired row.
+
+The program also creates a merged PDF packet of acquired receipts:
 
 ```text
 AMEX Transaction Details_merged_receipts.pdf
 ```
+
+The PDF starts with a cover page and table of contents, then appends the acquired receipt files.
 
 To skip the merged PDF:
 
@@ -109,6 +127,34 @@ Change the date window with:
 ```powershell
 --date-window-days 5
 ```
+
+Possible but uncertain matches can be controlled with:
+
+```powershell
+--review-threshold 0.40
+```
+
+Duplicate receipt candidates are called out in the match notes so those rows can be reviewed before filing.
+
+## Batch Run
+
+To process every transaction workbook under a folder:
+
+```powershell
+.\.venv\Scripts\python receipt_audit.py --batch-root "C:\Path\To\American Express"
+```
+
+The batch mode looks for workbook names containing `Transaction Details` and creates outputs beside each workbook.
+
+## Simple GUI
+
+To run with file pickers:
+
+```powershell
+.\.venv\Scripts\python receipt_audit.py --gui
+```
+
+The GUI asks for the workbook and receipt folder, then runs the standard rename, `DONE`, report, and merged PDF workflow.
 
 ## Example
 
