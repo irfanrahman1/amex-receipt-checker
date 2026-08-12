@@ -5,3 +5,7 @@ venv/
 *.egg-info/
 .pytest_cache/
 American Express/
+*_receipt_audit.xlsx
+*_merged_receipts.pdf
+*_audit_report.csv
+*_audit_report_unmatched_receipts.csv
