@@ -16,6 +16,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
+from vendor_lookup import extract_vendor, VendorLookup
 
 try:
     from pypdf import PdfReader, PdfWriter
@@ -75,7 +76,9 @@ STATUS_COLORS = {
     NEEDS_REVIEW_STATUS: "FFEB9C",
     MISSING_STATUS: "FFC7CE",
 }
-
+VENDOR_HEADER = "Vendor"
+ACCOUNT_CODE_HEADER = "Account Code"
+ACCOUNT_DESC_HEADER = "Account Description"
 
 @dataclass
 class Charge:
@@ -464,7 +467,14 @@ def ensure_output_columns(ws, header_row: int) -> Dict[str, int]:
         for col in range(1, ws.max_column + 1)
     }
     output = {}
-    for label in (STATUS_HEADER, MATCH_HEADER, NOTES_HEADER):
+    for label in (
+        STATUS_HEADER, 
+        MATCH_HEADER, 
+        NOTES_HEADER,
+        VENDOR_HEADER,
+        ACCOUNT_CODE_HEADER,
+        ACCOUNT_DESC_HEADER,
+    ):
         key = clean_text(label)
         if key in headers:
             output[label] = headers[key]
@@ -588,6 +598,9 @@ def write_reports(
         "matched_receipt",
         "score",
         "notes",
+        "vendor",
+        "account_code",
+        "account_description",
     ]
     with report_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -647,6 +660,7 @@ def audit_workbook(
     flag_column = receipt_flag_column(ws, header_row)
     receipts = load_receipts(receipts_dir, excel_path, recursive, ocr_enabled=ocr_enabled)
     done_dir = receipts_dir / "DONE" if move_to_done else None
+    vendor_lookup = VendorLookup()
 
     acquired = 0
     missing = 0
@@ -700,6 +714,15 @@ def audit_workbook(
         )
         status = ws.cell(row=charge.row, column=output_columns[STATUS_HEADER]).value
         apply_status_style(ws, charge.row, output_columns[STATUS_HEADER], status)
+        vendor_name = extract_vendor(charge.merchant)
+        vendor_result = vendor_lookup.match(vendor_name)
+        ws.cell(row=charge.row, column=output_columns[VENDOR_HEADER]).value = vendor_name
+        ws.cell(row=charge.row, column=output_columns[ACCOUNT_CODE_HEADER]).value = (
+            vendor_result.account_code or ""
+        )
+        ws.cell(row=charge.row, column=output_columns[ACCOUNT_DESC_HEADER]).value = (
+            vendor_result.account_description or ""
+        )
         report_rows.append(
             {
                 "row": str(charge.row),
@@ -710,6 +733,9 @@ def audit_workbook(
                 "matched_receipt": str(ws.cell(row=charge.row, column=output_columns[MATCH_HEADER]).value or ""),
                 "score": f"{match.score:.2f}",
                 "notes": match.notes,
+                "vendor": vendor_name,
+                "account_code": vendor_result.account_code or "",
+                "account_description": vendor_result.account_description or "",
             }
         )
 
