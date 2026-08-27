@@ -37,7 +37,7 @@ FUZZY_MATCH_THRESHOLD = 0.72
 # shows up as "MSBILL.INFO").
 VENDOR_ALIASES: List[Tuple[str, str]] = [
     (r"MSBILL\.INFO|A1010BUSD01|MICROSOFT", "MICROSOFT"),
-    (r"NYCT PAYGO", "NYCT PAYGO"),
+    (r"NYCT PAYGO|OMNY", "MTA"),
     (r"APPLE\.COM", "APPLE"),
     (r"GOOGLE \*YOUTUBE", "GOOGLE/YOUTUBE"),
     (r"AMAZON WEB SERVICES|\bAWS\b", "AWS"),
@@ -56,7 +56,6 @@ VENDOR_ALIASES: List[Tuple[str, str]] = [
     (r"\bUBER\b", "UBER"),
     (r"FINANCIAL TIMES", "FINANCIAL TIMES"),
     (r"GODADDY", "GODADDY"),
-    (r"OMNY VENDING", "OMNY (MTA)"),
     (r"CANVA", "CANVA"),
     (r"IN \*K AND GE LLC", "K AND GE LLC"),
     (r"UPWORK", "UPWORK"),
