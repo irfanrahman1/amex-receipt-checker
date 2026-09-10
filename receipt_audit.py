@@ -62,6 +62,7 @@ HEADER_ALIASES = {
         "doing business as",
     ),
     "amount": ("amount", "charge", "charge amount", "debit", "total", "extended amount"),
+    "category": ("category",),
 }
 
 STATUS_HEADER = "Receipt Status"
@@ -79,6 +80,9 @@ STATUS_COLORS = {
 VENDOR_HEADER = "Vendor"
 ACCOUNT_CODE_HEADER = "Account Code"
 ACCOUNT_DESC_HEADER = "Account Description"
+CODING_NOTE_HEADER = "Coding Note"
+CODING_NOTE_REVIEW_TEXT = "Best guess (new vendor) - please review"
+CODING_NOTE_COLOR = "FFEB9C"
 
 @dataclass
 class Charge:
@@ -86,6 +90,7 @@ class Charge:
     date: Optional[dt.date]
     merchant: str
     amount: Optional[Decimal]
+    category: str = ""
 
 
 @dataclass
@@ -474,6 +479,7 @@ def ensure_output_columns(ws, header_row: int) -> Dict[str, int]:
         VENDOR_HEADER,
         ACCOUNT_CODE_HEADER,
         ACCOUNT_DESC_HEADER,
+        CODING_NOTE_HEADER,
     ):
         key = clean_text(label)
         if key in headers:
@@ -502,9 +508,12 @@ def iter_charges(ws, header_row: int, columns: Dict[str, int]) -> Iterable[Charg
         date = None
         if "date" in columns:
             date = parse_date(ws.cell(row=row, column=columns["date"]).value)
+        category = ""
+        if "category" in columns:
+            category = str(ws.cell(row=row, column=columns["category"]).value or "")
         if amount is None and not merchant and date is None:
             continue
-        yield Charge(row=row, date=date, merchant=merchant, amount=amount)
+        yield Charge(row=row, date=date, merchant=merchant, amount=amount, category=category)
 
 
 def score_receipt(charge: Charge, receipt: Receipt, date_window_days: int) -> Tuple[float, List[str]]:
@@ -601,6 +610,7 @@ def write_reports(
         "vendor",
         "account_code",
         "account_description",
+        "coding_note",
     ]
     with report_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -716,13 +726,21 @@ def audit_workbook(
         apply_status_style(ws, charge.row, output_columns[STATUS_HEADER], status)
         vendor_name = extract_vendor(charge.merchant)
         vendor_result = vendor_lookup.match(vendor_name)
+        account_code = vendor_result.account_code or ""
+        account_desc = vendor_result.account_description or ""
+        coding_note = ""
+        if vendor_result.confidence == "not_found":
+            category_guess = vendor_lookup.match_category(charge.category)
+            if category_guess:
+                account_code, account_desc = category_guess
+                coding_note = CODING_NOTE_REVIEW_TEXT
         ws.cell(row=charge.row, column=output_columns[VENDOR_HEADER]).value = vendor_name
-        ws.cell(row=charge.row, column=output_columns[ACCOUNT_CODE_HEADER]).value = (
-            vendor_result.account_code or ""
-        )
-        ws.cell(row=charge.row, column=output_columns[ACCOUNT_DESC_HEADER]).value = (
-            vendor_result.account_description or ""
-        )
+        ws.cell(row=charge.row, column=output_columns[ACCOUNT_CODE_HEADER]).value = account_code
+        ws.cell(row=charge.row, column=output_columns[ACCOUNT_DESC_HEADER]).value = account_desc
+        ws.cell(row=charge.row, column=output_columns[CODING_NOTE_HEADER]).value = coding_note
+        if coding_note:
+            note_cell = ws.cell(row=charge.row, column=output_columns[CODING_NOTE_HEADER])
+            note_cell.fill = PatternFill(start_color=CODING_NOTE_COLOR, end_color=CODING_NOTE_COLOR, fill_type="solid")
         report_rows.append(
             {
                 "row": str(charge.row),

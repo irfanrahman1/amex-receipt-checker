@@ -1,6 +1,6 @@
 """Vendor name extraction and GL account code lookup.
 
-Implements the two steps Thomas asked for:
+Implements the steps Thomas asked for:
   1. extract_vendor(description) -> pulls a clean vendor name out of the raw
      AmEx "Description" text (e.g. "MSBILL.INFO" -> "MICROSOFT").
   2. VendorLookup.match(vendor) -> looks up that vendor name against two
@@ -10,10 +10,14 @@ Implements the two steps Thomas asked for:
          AmEx files. If the company has bought from this vendor before,
          that counts as a known match (no review flag needed), per
          Thomas's guidance.
-     Only vendors found in neither source are left unmatched.
+  3. VendorLookup.match_category(amex_category) -> for vendors found in
+     neither source, fall back to a best guess based on AmEx's own
+     transaction Category field -- but only for categories that were highly
+     consistent (>=85%) across the historical data. This is the ~15% of
+     cases Thomas expects will still need a flagged, human-reviewed guess.
 
-Both reference files are meant to keep growing over time -- this module
-just reads whatever rows currently exist in them.
+All three reference files are meant to keep growing over time -- this
+module just reads whatever rows currently exist in them.
 """
 
 import re
@@ -41,6 +45,18 @@ HISTORICAL_VENDOR_COL = 1
 HISTORICAL_CODE_COL = 2
 HISTORICAL_DESC_COL = 3
 HISTORICAL_START_ROW = 2
+
+# Category suggestions: for vendors never seen anywhere (not in the official
+# list, not in 17 months of history), fall back to a best guess based on
+# AmEx's own transaction Category field -- but ONLY for categories that were
+# highly consistent (>=85%) across the historical data. This is the ~15%
+# Thomas expects to still need a flagged, reviewed guess.
+CATEGORY_WORKBOOK = Path(__file__).resolve().parent / "category_suggestions.xlsx"
+CATEGORY_SHEET = "Category Suggestions"
+CATEGORY_NAME_COL = 1
+CATEGORY_CODE_COL = 2
+CATEGORY_DESC_COL = 3
+CATEGORY_START_ROW = 2
 
 FUZZY_MATCH_THRESHOLD = 0.72
 
@@ -140,33 +156,38 @@ class VendorLookupResult:
     matched_vendor: Optional[str]
     account_code: Optional[str]
     account_description: Optional[str]
-    confidence: str  # "exact", "fuzzy", "historical", "not_found"
+    confidence: str  # "exact", "fuzzy", "historical", "category_guess", "not_found"
 
 
 class VendorLookup:
-    """Looks up a vendor name, checking two sources in order:
+    """Looks up a vendor name, checking sources in order:
     1. vendor_lookup_reference.xlsx -- Thomas's official, curated list.
     2. historical_vendor_database.xlsx -- built from ~17 months of past
        AmEx files. If the company has bought from this vendor before, that
        counts as a known match (no review flag), per Thomas's guidance.
-    Only vendors found in neither source are left unmatched.
+    Vendors found in neither source can still get a category-based best
+    guess via match_category() -- see that method for details.
     """
 
     def __init__(
         self,
         reference_path: Path = REFERENCE_WORKBOOK,
         historical_path: Path = HISTORICAL_WORKBOOK,
+        category_path: Path = CATEGORY_WORKBOOK,
         fuzzy_threshold: float = FUZZY_MATCH_THRESHOLD,
     ):
         self.reference_path = reference_path
         self.historical_path = historical_path
+        self.category_path = category_path
         self.fuzzy_threshold = fuzzy_threshold
         self.entries: List[Tuple[str, str, str]] = []
         self._exact_index: Dict[str, Tuple[str, str, str]] = {}
         self.historical_entries: List[Tuple[str, str, str]] = []
         self._historical_index: Dict[str, Tuple[str, str, str]] = {}
+        self.category_index: Dict[str, Tuple[str, str]] = {}
         self._load()
         self._load_historical()
+        self._load_categories()
 
     def _load(self):
         if not self.reference_path.exists():
@@ -206,6 +227,21 @@ class VendorLookup:
             self.historical_entries.append((vendor, code, desc))
             self._historical_index[_normalize(vendor)] = (vendor, code, desc)
 
+    def _load_categories(self):
+        if not self.category_path.exists():
+            return
+        wb = load_workbook(self.category_path, data_only=True)
+        if CATEGORY_SHEET not in wb.sheetnames:
+            return
+        ws = wb[CATEGORY_SHEET]
+        for row in range(CATEGORY_START_ROW, ws.max_row + 1):
+            cat = ws.cell(row=row, column=CATEGORY_NAME_COL).value
+            code = ws.cell(row=row, column=CATEGORY_CODE_COL).value
+            desc = ws.cell(row=row, column=CATEGORY_DESC_COL).value
+            if not cat or not code:
+                continue
+            self.category_index[str(cat).strip().upper()] = (str(code).strip(), str(desc).strip())
+
     def match(self, vendor: str) -> VendorLookupResult:
         if not vendor:
             return VendorLookupResult(vendor, None, None, None, "not_found")
@@ -242,5 +278,14 @@ class VendorLookup:
         if best_entry and best_score >= self.fuzzy_threshold:
             return VendorLookupResult(vendor, best_entry[0], best_entry[1], best_entry[2], "historical")
 
-        # Tier 3: genuinely never seen before
+        # Tier 3: genuinely never seen before (caller may try match_category next)
         return VendorLookupResult(vendor, None, None, None, "not_found")
+
+    def match_category(self, amex_category: str) -> Optional[Tuple[str, str]]:
+        """Best-guess a code from AmEx's own Category field. Only returns a
+        result for categories that were highly consistent (>=85%) across 17
+        months of historical data. Caller should flag this as needing review.
+        """
+        if not amex_category:
+            return None
+        return self.category_index.get(str(amex_category).strip().upper())
