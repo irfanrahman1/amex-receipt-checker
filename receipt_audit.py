@@ -17,6 +17,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from vendor_lookup import extract_vendor, VendorLookup
+from frequency_lookup import FrequencyLookup
 
 try:
     from pypdf import PdfReader, PdfWriter
@@ -83,6 +84,7 @@ ACCOUNT_DESC_HEADER = "Account Description"
 CODING_NOTE_HEADER = "Coding Note"
 CODING_NOTE_REVIEW_TEXT = "Best guess (new vendor) - please review"
 CODING_NOTE_COLOR = "FFEB9C"
+FREQUENCY_HEADER = "Frequency"
 
 @dataclass
 class Charge:
@@ -480,6 +482,7 @@ def ensure_output_columns(ws, header_row: int) -> Dict[str, int]:
         ACCOUNT_CODE_HEADER,
         ACCOUNT_DESC_HEADER,
         CODING_NOTE_HEADER,
+        FREQUENCY_HEADER, 
     ):
         key = clean_text(label)
         if key in headers:
@@ -611,6 +614,7 @@ def write_reports(
         "account_code",
         "account_description",
         "coding_note",
+        "frequency", 
     ]
     with report_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -671,6 +675,7 @@ def audit_workbook(
     receipts = load_receipts(receipts_dir, excel_path, recursive, ocr_enabled=ocr_enabled)
     done_dir = receipts_dir / "DONE" if move_to_done else None
     vendor_lookup = VendorLookup()
+    frequency_lookup = FrequencyLookup()
 
     acquired = 0
     missing = 0
@@ -738,6 +743,9 @@ def audit_workbook(
         ws.cell(row=charge.row, column=output_columns[ACCOUNT_CODE_HEADER]).value = account_code
         ws.cell(row=charge.row, column=output_columns[ACCOUNT_DESC_HEADER]).value = account_desc
         ws.cell(row=charge.row, column=output_columns[CODING_NOTE_HEADER]).value = coding_note
+        frequency_result = frequency_lookup.classify(vendor_name, charge.date)
+        ws.cell(row=charge.row, column=output_columns[FREQUENCY_HEADER]).value = frequency_result.frequency
+
         if coding_note:
             note_cell = ws.cell(row=charge.row, column=output_columns[CODING_NOTE_HEADER])
             note_cell.fill = PatternFill(start_color=CODING_NOTE_COLOR, end_color=CODING_NOTE_COLOR, fill_type="solid")
@@ -754,6 +762,8 @@ def audit_workbook(
                 "vendor": vendor_name,
                 "account_code": vendor_result.account_code or "",
                 "account_description": vendor_result.account_description or "",
+                "coding_note": coding_note,            
+                "frequency": frequency_result.frequency
             }
         )
 

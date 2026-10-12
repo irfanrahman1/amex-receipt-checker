@@ -144,6 +144,55 @@ def extract_vendor(description: str) -> str:
     return cleaned.upper() if cleaned else desc.upper()
 
 
+def extract_frequency_key(description: str) -> str:
+    """Like extract_vendor(), but for a vendor whose AmEx lines mix several
+    genuinely different recurring products under one generic name -- so
+    Frequency classification needs a finer-grained key than account-code
+    lookup does.
+
+    Thomas confirmed at the Sept 28 check-in that Microsoft is this kind of
+    case: unlike Apple, Microsoft's billing descriptions usually carry real
+    product detail (which plan, which service), so there's likely a clean
+    monthly/annual pattern *per product* that extract_vendor()'s blanket
+    "MICROSOFT" bucket was hiding -- same root cause as the Apple problem,
+    just solvable here because the raw text has more to work with. Apple is
+    deliberately NOT split this way: Thomas said its descriptions don't
+    carry enough detail to make it worth doing, and it's lowest priority
+    regardless ("kind of a black box... we'd do that absolutely last").
+
+    IMPORTANT: this key is used ONLY for frequency classification
+    (frequency_lookup.py / build_frequency_database.py). It must never
+    replace extract_vendor()'s output for account-code lookup --
+    historical_vendor_database.xlsx and vendor_lookup_reference.xlsx are
+    keyed on the collapsed "MICROSOFT" name Thomas already coded, and
+    splitting that for account coding too would turn previously-confident
+    Microsoft matches into new "needs review" rows for no reason.
+    """
+    if not description:
+        return ""
+    desc = description.strip()
+    upper = desc.upper()
+
+    # Opaque reseller billing codes carry no real product detail to keep,
+    # so there's nothing finer to extract -- same collapsed bucket as before.
+    if re.search(r"MSBILL\.INFO|A1010BUSD01", upper):
+        return "MICROSOFT"
+
+    if "MICROSOFT" in upper:
+        cleaned = desc
+        for p in PREFIX_STRIP:
+            cleaned = re.sub(p, "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s{2,}[A-Za-z .]+\s+[A-Z]{2}\s*$", "", cleaned)
+        cleaned = re.sub(r"\s{2,}[A-Z]{2}\s*$", "", cleaned)
+        cleaned = re.sub(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b", "", cleaned)
+        cleaned = re.sub(r"\(\d{3}\)\d{3}-\d{4}", "", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" .*-")
+        return cleaned.upper() if cleaned else "MICROSOFT"
+
+    # Everything else: no known mixed-billing problem, same key as coding.
+    return extract_vendor(description)
+
+
 def _normalize(name: str) -> str:
     n = name.upper()
     n = re.sub(r"[^A-Z0-9 &]", " ", n)
